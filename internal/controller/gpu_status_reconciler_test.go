@@ -276,50 +276,79 @@ var _ = Describe("GpuStatusReconciler", func() {
 	})
 })
 
-// setHelmInstalledTrue patches the Gpu status to simulate GpuReconciler having
-// completed a successful Helm install.
 func setHelmInstalledTrue(gpuName string) { //nolint:unparam
 	gpu := &gpuv1beta1.Gpu{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: gpuName}, gpu)).To(Succeed())
-	patch := gpu.DeepCopy()
-	apimeta.SetStatusCondition(&gpu.Status.Conditions, metav1.Condition{
+	cond := metav1.Condition{
 		Type:               condHelmInstalled,
 		Status:             metav1.ConditionTrue,
 		Reason:             reasonInstalled,
 		Message:            "installed",
 		ObservedGeneration: gpu.Generation,
-	})
-	Expect(k8sClient.Status().Patch(ctx, gpu, client.MergeFrom(patch))).To(Succeed())
+		LastTransitionTime: metav1.Now(),
+	}
+	applyConditionSSA(gpuName, cond)
 }
 
-// setHelmInstalledFalse patches the Gpu status to simulate a failed Helm install.
 func setHelmInstalledFalse(gpuName string) {
 	gpu := &gpuv1beta1.Gpu{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: gpuName}, gpu)).To(Succeed())
-	patch := gpu.DeepCopy()
-	apimeta.SetStatusCondition(&gpu.Status.Conditions, metav1.Condition{
+	cond := metav1.Condition{
 		Type:               condHelmInstalled,
 		Status:             metav1.ConditionFalse,
 		Reason:             reasonFailed,
 		Message:            "helm failed",
 		ObservedGeneration: gpu.Generation,
-	})
-	Expect(k8sClient.Status().Patch(ctx, gpu, client.MergeFrom(patch))).To(Succeed())
+		LastTransitionTime: metav1.Now(),
+	}
+	applyConditionSSA(gpuName, cond)
 }
 
-// setPreflightTrue patches the Gpu status to simulate a passed preflight check.
 func setPreflightTrue(gpuName string) {
 	gpu := &gpuv1beta1.Gpu{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: gpuName}, gpu)).To(Succeed())
-	patch := gpu.DeepCopy()
-	apimeta.SetStatusCondition(&gpu.Status.Conditions, metav1.Condition{
+	cond := metav1.Condition{
 		Type:               condPreflight,
 		Status:             metav1.ConditionTrue,
 		Reason:             reasonPassed,
 		Message:            "passed",
 		ObservedGeneration: gpu.Generation,
-	})
-	Expect(k8sClient.Status().Patch(ctx, gpu, client.MergeFrom(patch))).To(Succeed())
+		LastTransitionTime: metav1.Now(),
+	}
+	applyConditionSSA(gpuName, cond)
+}
+
+// applyConditionSSA writes a condition via SSA under "gpu-controller", including all
+// other install-owned conditions so ForceOwnership doesn't drop them.
+func applyConditionSSA(gpuName string, cond metav1.Condition) {
+	GinkgoHelper()
+
+	gpu := &gpuv1beta1.Gpu{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: gpuName}, gpu)).To(Succeed())
+
+	// Merge the new condition into the live conditions (preserves LastTransitionTime).
+	conditions := append([]metav1.Condition(nil), gpu.Status.Conditions...)
+	apimeta.SetStatusCondition(&conditions, cond)
+
+	ownedConds := make([]any, 0, 2)
+	for _, t := range []string{condPreflight, condHelmInstalled} {
+		if c := apimeta.FindStatusCondition(conditions, t); c != nil {
+			ownedConds = append(ownedConds, conditionToUnstructured(*c))
+		}
+	}
+
+	u := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "gpu.kyma-project.io/v1beta1",
+			"kind":       "Gpu",
+			"metadata":   map[string]any{"name": gpuName},
+			"status":     map[string]any{"conditions": ownedConds},
+		},
+	}
+	Expect(k8sClient.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(u),
+		client.FieldOwner(fieldOwnerInstall),
+		client.ForceOwnership,
+	)).To(Succeed())
 }
 
 // createDriverDaemonSet creates the nvidia-driver-daemonset in gpu-operator namespace

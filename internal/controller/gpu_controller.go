@@ -23,6 +23,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -41,8 +42,10 @@ import (
 )
 
 const (
-	requeueWarn = 30 * time.Second
-	finalizer   = "gpu.kyma-project.io/gpu-operator"
+	requeueWarn       = 30 * time.Second
+	finalizer         = "gpu.kyma-project.io/gpu-operator"
+	fieldOwnerInstall = "gpu-controller"
+	fieldOwnerStatus  = "gpu-status-controller"
 )
 
 // GpuReconciler reconciles a Gpu object.
@@ -207,49 +210,105 @@ func (r *GpuReconciler) reconcileDelete(ctx context.Context, gpu *gpuv1beta1.Gpu
 		return ctrl.Result{}, fmt.Errorf("helm uninstall: %w", err)
 	}
 
-	controllerutil.RemoveFinalizer(gpu, finalizer)
-	if err := r.Update(ctx, gpu); err != nil {
+	// Re-read after the status apply above bumped ResourceVersion.
+	live := &gpuv1beta1.Gpu{}
+	if err := r.Get(ctx, types.NamespacedName{Name: gpu.Name}, live); err != nil {
+		return ctrl.Result{}, fmt.Errorf("re-fetching Gpu CR for finalizer removal: %w", err)
+	}
+	controllerutil.RemoveFinalizer(live, finalizer)
+	if err := r.Update(ctx, live); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing finalizer: %w", err)
 	}
 	return ctrl.Result{}, nil
 }
 
-// setPreflightCondition patches the Preflight condition and recomputes the Ready summary.
+// setPreflightCondition writes the Preflight condition via SSA under "gpu-controller".
 func (r *GpuReconciler) setPreflightCondition(ctx context.Context, gpu *gpuv1beta1.Gpu, status metav1.ConditionStatus, reason, message string) error {
-	patch := client.MergeFrom(gpu.DeepCopy())
-	apimeta.SetStatusCondition(&gpu.Status.Conditions, metav1.Condition{
-		Type:               condPreflight,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		ObservedGeneration: gpu.Generation,
-	})
-	apimeta.SetStatusCondition(&gpu.Status.Conditions, computeReadySummary(gpu.Status.Conditions, gpu.Generation))
-	if err := r.Status().Patch(ctx, gpu, patch); err != nil {
-		return fmt.Errorf("patching Preflight condition: %w", err)
+	return r.applyInstallStatus(ctx, gpu, metav1.Condition{
+		Type:    condPreflight,
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	}, "")
+}
+
+// setHelmCondition writes the HelmInstalled condition and optionally operatorVersion via SSA.
+func (r *GpuReconciler) setHelmCondition(ctx context.Context, gpu *gpuv1beta1.Gpu, status metav1.ConditionStatus, reason, message string, operatorVersion string) error {
+	return r.applyInstallStatus(ctx, gpu, metav1.Condition{
+		Type:    condHelmInstalled,
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	}, operatorVersion)
+}
+
+// applyInstallStatus writes the owned conditions (Preflight, HelmInstalled) and
+// optionally operatorVersion via SSA under "gpu-controller". Both owned conditions
+// are always included so SSA field manager ownership doesn't drop a previously
+// written condition when only the other one is being updated.
+func (r *GpuReconciler) applyInstallStatus(ctx context.Context, gpu *gpuv1beta1.Gpu, cond metav1.Condition, operatorVersion string) error {
+	// Re-read so conditions set earlier in this reconcile cycle are included.
+	live := &gpuv1beta1.Gpu{}
+	if err := r.Get(ctx, types.NamespacedName{Name: gpu.Name}, live); err != nil {
+		return fmt.Errorf("re-fetching Gpu CR for status apply: %w", err)
+	}
+
+	// ObservedGeneration set from live (not the caller snapshot) and
+	// LastTransitionTime preserved when status is unchanged.
+	cond.ObservedGeneration = live.Generation
+	conditions := append([]metav1.Condition(nil), live.Status.Conditions...)
+	apimeta.SetStatusCondition(&conditions, cond)
+
+	// Include all owned conditions in every apply — omitting one removes it.
+	ownedTypes := []string{condPreflight, condHelmInstalled}
+	ownedConditions := make([]any, 0, len(ownedTypes))
+	for _, t := range ownedTypes {
+		if c := apimeta.FindStatusCondition(conditions, t); c != nil {
+			ownedConditions = append(ownedConditions, conditionToUnstructured(*c))
+		}
+	}
+
+	effectiveVersion := operatorVersion
+	if effectiveVersion == "" {
+		effectiveVersion = live.Status.OperatorVersion
+	}
+
+	statusObj := map[string]any{
+		"conditions": ownedConditions,
+	}
+	if effectiveVersion != "" {
+		statusObj["operatorVersion"] = effectiveVersion
+	}
+
+	u := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "gpu.kyma-project.io/v1beta1",
+			"kind":       "Gpu",
+			"metadata":   map[string]any{"name": gpu.Name},
+			"status":     statusObj,
+		},
+	}
+	if err := r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(u),
+		client.FieldOwner(fieldOwnerInstall),
+		client.ForceOwnership,
+	); err != nil {
+		return fmt.Errorf("applying %s condition: %w", cond.Type, err)
 	}
 	return nil
 }
 
-// setHelmCondition patches the HelmInstalled condition, optionally operatorVersion,
-// and recomputes the Ready summary - all in a single status patch.
-func (r *GpuReconciler) setHelmCondition(ctx context.Context, gpu *gpuv1beta1.Gpu, status metav1.ConditionStatus, reason, message string, operatorVersion string) error {
-	patch := client.MergeFrom(gpu.DeepCopy())
-	if operatorVersion != "" {
-		gpu.Status.OperatorVersion = operatorVersion
+// conditionToUnstructured converts a metav1.Condition to the map[string]any form
+// expected by the unstructured SSA apply path.
+func conditionToUnstructured(c metav1.Condition) map[string]any {
+	m := map[string]any{
+		"type":               c.Type,
+		"status":             string(c.Status),
+		"reason":             c.Reason,
+		"message":            c.Message,
+		"lastTransitionTime": c.LastTransitionTime.UTC().Format(time.RFC3339),
+		"observedGeneration": c.ObservedGeneration,
 	}
-	apimeta.SetStatusCondition(&gpu.Status.Conditions, metav1.Condition{
-		Type:               condHelmInstalled,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		ObservedGeneration: gpu.Generation,
-	})
-	apimeta.SetStatusCondition(&gpu.Status.Conditions, computeReadySummary(gpu.Status.Conditions, gpu.Generation))
-	if err := r.Status().Patch(ctx, gpu, patch); err != nil {
-		return fmt.Errorf("patching HelmInstalled condition: %w", err)
-	}
-	return nil
+	return m
 }
 
 // SetupWithManager registers the controller with the manager and wires up a Node

@@ -92,23 +92,63 @@ func (r *GpuStatusReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	driverStatus, driverReason, driverMsg, driverInfo := r.checkDriverDaemonSet(ctx)
 	validatorStatus, validatorReason, validatorMsg := r.checkClusterPolicy(ctx)
 
-	scratch := append([]metav1.Condition(nil), gpu.Status.Conditions...)
-	setCondition(&scratch, condDriverReady, driverStatus, driverReason, driverMsg, gpu.Generation)
-	setCondition(&scratch, condValidatorPassed, validatorStatus, validatorReason, validatorMsg, gpu.Generation)
-	apimeta.SetStatusCondition(&scratch, computeReadySummary(scratch, gpu.Generation))
+	// Re-read before the no-op check and the apply so Ready is computed from
+	// the freshest Preflight/HelmInstalled written by GpuReconciler.
+	live := &gpuv1beta1.Gpu{}
+	if err := r.Get(ctx, req.NamespacedName, live); err != nil {
+		return ctrl.Result{}, fmt.Errorf("re-fetching Gpu CR before status apply: %w", err)
+	}
 
-	if conditionMatches(gpu.Status.Conditions, condDriverReady, driverStatus, driverReason, driverMsg) &&
-		conditionMatches(gpu.Status.Conditions, condValidatorPassed, validatorStatus, validatorReason, validatorMsg) &&
-		driverStatusMatches(gpu.Status.Driver, driverInfo) {
+	if conditionMatches(live.Status.Conditions, condDriverReady, driverStatus, driverReason, driverMsg) &&
+		conditionMatches(live.Status.Conditions, condValidatorPassed, validatorStatus, validatorReason, validatorMsg) &&
+		driverStatusMatches(live.Status.Driver, driverInfo) {
 		return ctrl.Result{RequeueAfter: requeueWarn}, nil
 	}
 
-	patch := client.MergeFrom(gpu.DeepCopy())
-	gpu.Status.Conditions = scratch
-	gpu.Status.Driver = driverInfo
+	// Build conditions from live state and send only owned types via SSA.
+	merged := append([]metav1.Condition(nil), live.Status.Conditions...)
+	setCondition(&merged, condDriverReady, driverStatus, driverReason, driverMsg, live.Generation)
+	setCondition(&merged, condValidatorPassed, validatorStatus, validatorReason, validatorMsg, live.Generation)
+	apimeta.SetStatusCondition(&merged, computeReadySummary(merged, live.Generation))
 
-	if err := r.Status().Patch(ctx, gpu, patch); err != nil {
-		return ctrl.Result{}, fmt.Errorf("patching Gpu status: %w", err)
+	// Extract only owned conditions; API server merges with gpu-controller's fields.
+	ownedTypes := []string{condDriverReady, condValidatorPassed, condReady}
+	ownedConditions := make([]metav1.Condition, 0, len(ownedTypes))
+	for _, t := range ownedTypes {
+		if c := apimeta.FindStatusCondition(merged, t); c != nil {
+			ownedConditions = append(ownedConditions, *c)
+		}
+	}
+
+	// Apply only the fields owned by this controller via the non-deprecated SSA path.
+	ownedCondUnstructured := make([]any, 0, len(ownedConditions))
+	for _, c := range ownedConditions {
+		ownedCondUnstructured = append(ownedCondUnstructured, conditionToUnstructured(c))
+	}
+
+	statusObj := map[string]any{
+		"conditions": ownedCondUnstructured,
+	}
+	if driverInfo != nil {
+		statusObj["driver"] = map[string]any{
+			"version":    driverInfo.Version,
+			"nodesReady": driverInfo.NodesReady,
+		}
+	}
+
+	u := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "gpu.kyma-project.io/v1beta1",
+			"kind":       "Gpu",
+			"metadata":   map[string]any{"name": live.Name},
+			"status":     statusObj,
+		},
+	}
+	if err := r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(u),
+		client.FieldOwner(fieldOwnerStatus),
+		client.ForceOwnership,
+	); err != nil {
+		return ctrl.Result{}, fmt.Errorf("applying Gpu status: %w", err)
 	}
 
 	logger.Info("status synced", "driverReady", driverStatus, "validatorPassed", validatorStatus)
