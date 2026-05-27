@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release - bare semver without 'v' (e.g. 0.1.0)"
+        required: true
+        type: string
+      ref:
+        description: "Branch, tag, or SHA to release from"
+        required: true
+        default: "main"
+        type: string
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: europe-docker.pkg.dev/kyma-project/prod/gpu
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Check version format
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! echo "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "::error::version must be bare semver (e.g. 0.1.0 or 0.1.0-rc.1) - got '${VERSION}'"
+            exit 1
+          fi
+
+      - name: Check tag does not already exist
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git ls-remote --quiet --exit-code origin "refs/tags/${VERSION}" >/dev/null; then
+            echo "::error::tag ${VERSION} already exists"
+            exit 1
+          fi
+
+  build-image:
+    name: Build Image
+    needs: validate
+    permissions:
+      id-token: write
+      contents: read
+    uses: kyma-project/test-infra/.github/workflows/image-builder.yml@main
+    with:
+      name: gpu
+      dockerfile: Dockerfile
+      context: .
+      tags: ${{ inputs.version }}
+
+  test:
+    name: Test
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
+
+  create-tag:
+    name: Create Tag
+    needs: [build-image, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create and push annotated tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git tag -a "${VERSION}" -m "Release ${VERSION}"
+          git push origin "${VERSION}"
+
+  publish-release:
+    name: Publish Release
+    needs: create-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Render install.yaml
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          make build-installer IMG=${IMAGE}:${VERSION}
+
+      - name: Generate release notes
+        env:
+          VERSION: ${{ inputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            CHANGES=$(git log "${PREV_TAG}..${VERSION}" \
+              --pretty=format:"- %s (%h)" --no-merges)
+          else
+            CHANGES=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          fi
+          {
+            echo "## Changes"
+            echo ""
+            echo "${CHANGES}"
+            echo ""
+            echo "## Installation"
+            echo ""
+            echo '```bash'
+            echo "# Install the GPU operator (CRD, RBAC, and controller)"
+            echo "kubectl apply -f https://github.com/${REPOSITORY}/releases/download/${VERSION}/install.yaml"
+            echo ""
+            echo "# Create a Gpu resource to enable GPU support on your cluster"
+            echo "kubectl apply -f https://github.com/${REPOSITORY}/releases/download/${VERSION}/instance.yaml"
+            echo '```'
+            echo ""
+            echo "## Image"
+            echo ""
+            echo "\`${IMAGE}:${VERSION}\`"
+          } > /tmp/release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "${VERSION}" \
+            --title "${VERSION}" \
+            --notes-file /tmp/release-notes.md \
+            dist/install.yaml \
+            dist/instance.yaml
