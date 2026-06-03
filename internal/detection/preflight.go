@@ -23,6 +23,15 @@ import (
 	sigs "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// OSType identifies the operating system running on a GPU node.
+type OSType string
+
+const (
+	OSTypeGardenLinux OSType = "gardenlinux"
+	OSTypeUbuntu      OSType = "ubuntu"
+	OSTypeUnknown     OSType = ""
+)
+
 // Outcome represents the result of a pre-flight check.
 type Outcome int
 
@@ -42,6 +51,7 @@ const (
 type PreflightResult struct {
 	Outcome Outcome
 	Reason  string
+	OS      OSType
 }
 
 // RunPreflight inspects cluster nodes and determines whether it is safe to proceed
@@ -50,7 +60,8 @@ type PreflightResult struct {
 //
 // Checks performed (in order):
 //  1. Are there any GPU nodes? If not then Warn (nodes may not have joined yet).
-//  2. Are all GPU nodes running Garden Linux? If not then Error (v1 supports Garden Linux only).
+//  2. Do all GPU nodes run a supported OS (Garden Linux or Ubuntu)? If not then Error.
+//  3. Do all GPU nodes run the same OS? Mixed clusters are not supported at this point; Error if mixed.
 func RunPreflight(ctx context.Context, c sigs.Client) (PreflightResult, error) {
 	var nodeList corev1.NodeList
 	if err := c.List(ctx, &nodeList); err != nil {
@@ -66,14 +77,43 @@ func RunPreflight(ctx context.Context, c sigs.Client) (PreflightResult, error) {
 		}, nil
 	}
 
-	if nonGL := nonGardenLinuxNodes(gpuNodes); len(nonGL) > 0 {
+	var unsupported []string
+	osTypes := map[OSType]bool{}
+	for _, n := range gpuNodes {
+		os, ok := detectNodeOS(n)
+		if !ok {
+			unsupported = append(unsupported, fmt.Sprintf("%s (%s)", n.Name, n.Status.NodeInfo.OSImage))
+			continue
+		}
+		osTypes[os] = true
+	}
+
+	if len(unsupported) > 0 {
+		// Unsupported nodes are checked before mixed-OS: if any node has an unknown OS
+		// it is excluded from osTypes, so the mixed-OS check below would fire on a
+		// partial view of the cluster. Reporting unsupported nodes first gives a clearer
+		// error and avoids the misleading "mixed OS" message.
 		return PreflightResult{
 			Outcome: OutcomeError,
-			Reason:  fmt.Sprintf("GPU nodes %v are not running Garden Linux; only Garden Linux is supported in v1", nonGL),
+			Reason:  fmt.Sprintf("GPU nodes with unsupported OS: %v; supported operating systems: Garden Linux, Ubuntu", unsupported),
 		}, nil
 	}
 
-	return PreflightResult{Outcome: OutcomeProceed}, nil
+	if len(osTypes) > 1 {
+		return PreflightResult{
+			Outcome: OutcomeError,
+			Reason:  "GPU nodes are running mixed operating systems; all GPU nodes must run the same OS (Garden Linux or Ubuntu)",
+		}, nil
+	}
+
+	// At this point: no unsupported nodes, no mixed OS, so osTypes contains exactly
+	// one entry. Range-iterate to extract it (len == 1 is guaranteed by the checks above).
+	var detectedOS OSType
+	for os := range osTypes {
+		detectedOS = os
+	}
+
+	return PreflightResult{Outcome: OutcomeProceed, OS: detectedOS}, nil
 }
 
 // filterGPUNodes returns only the nodes whose instance type label matches a known GPU type.
@@ -87,13 +127,16 @@ func filterGPUNodes(nodes []corev1.Node) []corev1.Node {
 	return gpu
 }
 
-// nonGardenLinuxNodes returns the names of GPU nodes that are not running Garden Linux.
-func nonGardenLinuxNodes(nodes []corev1.Node) []string {
-	var names []string
-	for i := range nodes {
-		if !strings.Contains(nodes[i].Status.NodeInfo.OSImage, "Garden Linux") {
-			names = append(names, nodes[i].Name)
-		}
+// detectNodeOS identifies the OS type from node.Status.NodeInfo.OSImage.
+// Returns false if the OS is not one of the supported types.
+func detectNodeOS(node corev1.Node) (OSType, bool) {
+	img := strings.ToLower(node.Status.NodeInfo.OSImage)
+	switch {
+	case strings.Contains(img, "garden linux"):
+		return OSTypeGardenLinux, true
+	case strings.Contains(img, "ubuntu"):
+		return OSTypeUbuntu, true
+	default:
+		return OSTypeUnknown, false
 	}
-	return names
 }
