@@ -43,10 +43,14 @@ type fakeInstaller struct {
 	uninstallCalled bool
 	installErr      error
 	uninstallErr    error
+	installFn       func(context.Context, []byte, map[string]any) error
 }
 
-func (f *fakeInstaller) InstallOrUpgrade(_ context.Context, _ []byte, _ map[string]any) error {
+func (f *fakeInstaller) InstallOrUpgrade(ctx context.Context, chart []byte, values map[string]any) error {
 	f.installCalls++
+	if f.installFn != nil {
+		return f.installFn(ctx, chart, values)
+	}
 	return f.installErr
 }
 
@@ -464,6 +468,63 @@ var _ = Describe("GpuReconciler", func() {
 			Expect(gpu.Status.OperatorVersion).To(Equal(versionAfterFirst))
 			Expect(installer.installCalls).To(Equal(2))
 		})
+	})
+
+	Describe("time-slicing", func() {
+		BeforeEach(func() {
+			newGpu(gpuName)
+			_, err := reconciler.Reconcile(ctx, req) // adds finalizer
+			Expect(err).NotTo(HaveOccurred())
+			newGpuNode("gpu-node-ts", "g4dn.xlarge", "Garden Linux 1312.3")
+			DeferCleanup(deleteNode, "gpu-node-ts")
+		})
+
+		It("passes devicePlugin.config helm values when spec.timeSlicing is set", func() {
+			var capturedValues map[string]any
+			installer.installFn = func(_ context.Context, _ []byte, values map[string]any) error {
+				capturedValues = values
+				return nil
+			}
+
+			gpu := &gpuv1beta1.Gpu{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: gpuName}, gpu)).To(Succeed())
+			gpu.Spec.TimeSlicing = &gpuv1beta1.TimeSlicingSpec{Replicas: 4}
+			Expect(k8sClient.Update(ctx, gpu)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(capturedValues).To(HaveKey("devicePlugin"))
+			dp := capturedValues["devicePlugin"].(map[string]any)
+			cfg := dp["config"].(map[string]any)
+			Expect(cfg["create"]).To(BeTrue())
+			Expect(cfg["name"]).To(Equal("gpu-time-slicing-config-4"))
+			Expect(cfg["default"]).To(Equal("any"))
+			data := cfg["data"].(map[string]any)
+			Expect(data["any"].(string)).To(ContainSubstring("replicas: 4"))
+		})
+
+		It("omits devicePlugin.config helm values when spec.timeSlicing is absent", func() {
+			var capturedValues map[string]any
+			installer.installFn = func(_ context.Context, _ []byte, values map[string]any) error {
+				capturedValues = values
+				return nil
+			}
+
+			newGpu2 := &gpuv1beta1.Gpu{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: gpuName}, newGpu2)).To(Succeed())
+			Expect(newGpu2.Spec.TimeSlicing).To(BeNil())
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			if dp, ok := capturedValues["devicePlugin"]; ok {
+				if dpMap, ok := dp.(map[string]any); ok {
+					Expect(dpMap).NotTo(HaveKey("config"))
+				}
+			}
+		})
+
 	})
 
 	Describe("deletion", func() {

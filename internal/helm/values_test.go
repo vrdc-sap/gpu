@@ -15,6 +15,8 @@ limitations under the License.
 package helm
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	gpuv1beta1 "github.com/kyma-project/gpu/api/v1beta1"
@@ -90,6 +92,21 @@ func TestBuildValues(t *testing.T) {
 			wantRepo:          nvidiaDriverRepo,
 			wantVersionAbsent: true,
 		},
+		{
+			name:             "time-slicing enabled - devicePlugin.config keys are set",
+			spec:             gpuv1beta1.GpuSpec{TimeSlicing: &gpuv1beta1.TimeSlicingSpec{Replicas: 4}},
+			cluster:          ClusterInfo{OS: detection.OSTypeGardenLinux},
+			wantRepo:         "ghcr.io/gardenlinux/gardenlinux-nvidia-installer/1.10.0",
+			wantVersion:      "590",
+			wantTopLevelKeys: []string{"cdi", "toolkit", "node-feature-discovery"},
+		},
+		{
+			name:              "time-slicing disabled - devicePlugin.config keys are absent",
+			spec:              gpuv1beta1.GpuSpec{},
+			cluster:           ClusterInfo{OS: detection.OSTypeUbuntu},
+			wantRepo:          nvidiaDriverRepo,
+			wantVersionAbsent: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -124,6 +141,53 @@ func TestBuildValues(t *testing.T) {
 			} else {
 				assertString(t, driverMap, "version", tt.wantVersion)
 			}
+
+			if tt.spec.TimeSlicing != nil {
+				dpRaw, ok := got["devicePlugin"]
+				if !ok {
+					t.Fatal("devicePlugin key absent when TimeSlicing is set")
+				}
+				dpMap, ok := dpRaw.(map[string]any)
+				if !ok {
+					t.Fatalf("devicePlugin is %T, want map[string]any", dpRaw)
+				}
+				cfgRaw, ok := dpMap["config"]
+				if !ok {
+					t.Fatal("devicePlugin.config key absent when TimeSlicing is set")
+				}
+				cfgMap, ok := cfgRaw.(map[string]any)
+				if !ok {
+					t.Fatalf("devicePlugin.config is %T, want map[string]any", cfgRaw)
+				}
+				if create, _ := cfgMap["create"].(bool); !create {
+					t.Errorf("devicePlugin.config.create = %v, want true", cfgMap["create"])
+				}
+				assertString(t, cfgMap, "name", "gpu-time-slicing-config-4")
+				assertString(t, cfgMap, "default", "any")
+				dataRaw, ok := cfgMap["data"]
+				if !ok {
+					t.Fatal("devicePlugin.config.data key absent when TimeSlicing is set")
+				}
+				dataMap, ok := dataRaw.(map[string]any)
+				if !ok {
+					t.Fatalf("devicePlugin.config.data is %T, want map[string]any", dataRaw)
+				}
+				anyVal, ok := dataMap["any"].(string)
+				if !ok {
+					t.Fatalf("devicePlugin.config.data[\"any\"] is %T, want string", dataMap["any"])
+				}
+				wantReplicas := fmt.Sprintf("replicas: %d", tt.spec.TimeSlicing.Replicas)
+				if !contains(anyVal, wantReplicas) {
+					t.Errorf("devicePlugin.config.data[\"any\"] = %q, want it to contain %q", anyVal, wantReplicas)
+				}
+			} else {
+				if dp, ok := got["devicePlugin"]; ok {
+					dpMap, _ := dp.(map[string]any)
+					if cfg, hasCfg := dpMap["config"]; hasCfg {
+						t.Errorf("devicePlugin.config = %v, want key absent when TimeSlicing is nil", cfg)
+					}
+				}
+			}
 		})
 	}
 }
@@ -143,4 +207,31 @@ func assertString(t *testing.T, m map[string]any, key, want string) {
 	if s != want {
 		t.Errorf("key %q = %q, want %q", key, s, want)
 	}
+}
+
+func contains(s, substr string) bool {
+	return strings.Contains(s, substr)
+}
+
+func TestTimeSlicingConfigMapName(t *testing.T) {
+	t.Run("includes replica count in name", func(t *testing.T) {
+		spec := gpuv1beta1.GpuSpec{TimeSlicing: &gpuv1beta1.TimeSlicingSpec{Replicas: 4}}
+		if got := TimeSlicingConfigMapName(spec); got != "gpu-time-slicing-config-4" {
+			t.Errorf("TimeSlicingConfigMapName() = %q, want %q", got, "gpu-time-slicing-config-4")
+		}
+	})
+
+	t.Run("different replicas produce different names", func(t *testing.T) {
+		spec4 := gpuv1beta1.GpuSpec{TimeSlicing: &gpuv1beta1.TimeSlicingSpec{Replicas: 4}}
+		spec8 := gpuv1beta1.GpuSpec{TimeSlicing: &gpuv1beta1.TimeSlicingSpec{Replicas: 8}}
+		if TimeSlicingConfigMapName(spec4) == TimeSlicingConfigMapName(spec8) {
+			t.Error("TimeSlicingConfigMapName() returned same name for different replica counts")
+		}
+	})
+
+	t.Run("returns empty string when time-slicing is nil", func(t *testing.T) {
+		if got := TimeSlicingConfigMapName(gpuv1beta1.GpuSpec{}); got != "" {
+			t.Errorf("TimeSlicingConfigMapName() = %q, want \"\"", got)
+		}
+	})
 }
